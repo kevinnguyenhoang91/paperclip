@@ -23,6 +23,10 @@ GitHub Actions owns `pnpm-lock.yaml`.
 - Pull request CI validates dependency resolution when manifests change.
 - Pushes to `master` regenerate `pnpm-lock.yaml` with `pnpm install --lockfile-only --no-frozen-lockfile`, commit it back if needed, and then run verification with `--frozen-lockfile`.
 
+## Repo-local Agent Artifacts
+
+Some local agent tooling may write state under `.omc/` (and occasionally nested `.omc/` directories under subprojects). These are **local-only artifacts** and are ignored by git via `.gitignore`.
+
 ## Start Dev
 
 From repo root:

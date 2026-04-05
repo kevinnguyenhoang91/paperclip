@@ -66,6 +66,7 @@ export interface CompanySkillDetail extends CompanySkill {
   attachedAgentCount: number;
   usedByAgents: CompanySkillUsageAgent[];
   editable: boolean;
+  deletable: boolean;
   editableReason: string | null;
   sourceLabel: string | null;
   sourceBadge: CompanySkillSourceBadge;
