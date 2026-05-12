@@ -46,6 +46,11 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_CURSOR_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { parseCursorJsonl, isCursorUnknownSessionError } from "./parse.js";
+import {
+  appendCursorRetrievalTraceFailure,
+  extractCursorRetrievalTracePaths,
+  seedCursorRetrievalTraceLogIfEmpty,
+} from "./cursor-retrieval-trace.js";
 import { prepareCursorSandboxCommand } from "./remote-command.js";
 import { normalizeCursorStreamLine } from "../shared/stream.js";
 import { hasCursorTrustBypassArg } from "../shared/trust.js";
@@ -589,6 +594,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const runAttempt = async (resumeSessionId: string | null) => {
     const args = buildArgs(resumeSessionId);
+    const seededRetrievalTracePaths = new Set<string>();
+    let lastRetrievalTracePath: string | null = null;
+    let stderrAccumulator = "";
+
     if (onMeta) {
       await onMeta({
         adapterType: "cursor",
@@ -636,6 +645,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onSpawn,
       onLog: async (stream, chunk) => {
         if (stream !== "stdout") {
+          stderrAccumulator += chunk;
+          for (const tracePath of extractCursorRetrievalTracePaths(chunk)) {
+            lastRetrievalTracePath = tracePath;
+            if (!seededRetrievalTracePaths.has(tracePath)) {
+              seededRetrievalTracePaths.add(tracePath);
+              try {
+                await seedCursorRetrievalTraceLogIfEmpty(tracePath, { runId });
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                await onLog(
+                  "stderr",
+                  `${JSON.stringify({
+                    ok: false,
+                    stage: "trace_seed_failed",
+                    error: msg,
+                    hints: [`Could not seed cursor-retrieval trace file: ${tracePath}`],
+                    runId,
+                    tracePath,
+                  })}\n`,
+                );
+              }
+            }
+          }
           await onLog(stream, chunk);
           return;
         }
@@ -643,6 +675,66 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
     });
     await flushStdoutChunk("", true);
+
+    for (const tracePath of extractCursorRetrievalTracePaths(stderrAccumulator)) {
+      lastRetrievalTracePath = tracePath;
+      if (!seededRetrievalTracePaths.has(tracePath)) {
+        seededRetrievalTracePaths.add(tracePath);
+        try {
+          await seedCursorRetrievalTraceLogIfEmpty(tracePath, { runId });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await onLog(
+            "stderr",
+            `${JSON.stringify({
+              ok: false,
+              stage: "trace_seed_failed",
+              error: msg,
+              hints: [`Could not seed cursor-retrieval trace file: ${tracePath}`],
+              runId,
+              tracePath,
+            })}\n`,
+          );
+        }
+      }
+    }
+
+    const failedRun = proc.timedOut || (proc.exitCode ?? 0) !== 0;
+    if (failedRun && lastRetrievalTracePath) {
+      const stderrLine = firstNonEmptyLine(proc.stderr);
+      const errorText = proc.timedOut
+        ? `Timed out after ${timeoutSec}s`
+        : stderrLine || `Cursor exited with code ${proc.exitCode ?? -1}`;
+      try {
+        await appendCursorRetrievalTraceFailure(lastRetrievalTracePath, {
+          runId,
+          stage: proc.timedOut ? "timeout" : "process_exit",
+          error: errorText,
+          hints: [
+            "See Paperclip run NDJSON / stdout+stderr for the full adapter stream.",
+            "If this file was empty before this line, Paperclip appended this envelope after detecting cursor-retrieval tracing.",
+          ],
+          exitCode: proc.exitCode,
+          timedOut: proc.timedOut,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog(
+          "stderr",
+          `${JSON.stringify({
+            ok: false,
+            stage: "trace_append_failed",
+            error: msg,
+            hints: [
+              `Failed to append failure envelope to cursor-retrieval trace file: ${lastRetrievalTracePath}`,
+              "Inspect stderr above for the original cursor-retrieval tracing line.",
+            ],
+            runId,
+            tracePath: lastRetrievalTracePath,
+          })}\n`,
+        );
+      }
+    }
 
     return {
       proc,
